@@ -20,15 +20,19 @@ import com.google.android.gms.maps.model.LatLng
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 class TimesheetService : Service() {
 
     private lateinit var fusedLocationClient: FusedLocationProviderClient
     private lateinit var database: AppDatabase
     private val serviceScope = CoroutineScope(Dispatchers.IO + Job())
+
+    // Tracks which phase the service is currently in
+    private var isHunting = false
+    private var isTracking = false
 
     override fun onCreate() {
         super.onCreate()
@@ -38,133 +42,179 @@ class TimesheetService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // 1. Immediately start the foreground notification to satisfy Android OS
         val notification = NotificationCompat.Builder(this, "TIMESHEET_CHANNEL")
             .setContentTitle("Field Tracker")
-            .setContentText("Verifying location...")
+            .setContentText("Initializing tracking...")
             .setSmallIcon(android.R.drawable.ic_menu_mylocation)
             .build()
 
         startForeground(1, notification)
 
-        // 2. Process the trigger
         val transitionType = intent?.getIntExtra("TRANSITION_TYPE", -1)
         if (transitionType != -1) {
-            verifyLocationAndLog(transitionType!!)
+            handleGeofenceTrigger(transitionType!!)
         }
 
         return START_STICKY
     }
 
-    private fun verifyLocationAndLog(transitionType: Int) {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            stopSelf()
-            return
+    private fun handleGeofenceTrigger(transitionType: Int) {
+        if (transitionType == Geofence.GEOFENCE_TRANSITION_ENTER) {
+            Log.d("TimesheetService", "OS triggered 150m ENTER. Checking Polygon...")
+            checkInitialEntry()
+        } else if (transitionType == Geofence.GEOFENCE_TRANSITION_EXIT) {
+            Log.d("TimesheetService", "OS triggered 150m EXIT. Forcing logout.")
+            // If they completely left the 150m circle, force an EXIT log.
+            logExitAndStop(null)
         }
+    }
 
-        // Request exactly ONE high-accuracy GPS ping
+    private fun checkInitialEntry() {
+        if (!hasLocationPermission()) return
+
         fusedLocationClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, null)
             .addOnSuccessListener { location ->
                 if (location != null) {
                     val currentPoint = LatLng(location.latitude, location.longitude)
-
-                    // Fetch the polygon from SharedPreferences
                     val activePolygon = getActivePolygonFromMemory()
 
-                    val isInsidePolygon = GeoUtils.isPointInPolygon(currentPoint, activePolygon)
-
-                    serviceScope.launch {
-                        if (transitionType == Geofence.GEOFENCE_TRANSITION_ENTER && isInsidePolygon) {
-                            Log.d("TimesheetService", "Verified ENTER. Saving to DB.")
-
-                            // FIXED: Changed 'type' to 'eventType' and removed 'worksiteId'
-                            database.trackerDao().insertLog(
-                                TimeLog(eventType = "ENTER", timestamp = System.currentTimeMillis(), latitude = currentPoint.latitude, longitude = currentPoint.longitude)
-                            )
-                            updateNotification("On Site: Tracking Hours")
-                            start30MinuteHeartbeat()
-
-                        } else if (transitionType == Geofence.GEOFENCE_TRANSITION_EXIT) {
-                            Log.d("TimesheetService", "Verified EXIT. Saving to DB.")
-
-                            // FIXED: Changed 'type' to 'eventType' and removed 'worksiteId'
-                            database.trackerDao().insertLog(
-                                TimeLog(eventType = "EXIT", timestamp = System.currentTimeMillis(), latitude = currentPoint.latitude, longitude = currentPoint.longitude)
-                            )
-                            stopForeground(STOP_FOREGROUND_REMOVE)
-                            stopSelf()
-                        } else {
-                            Log.d("TimesheetService", "False trigger. Ignored.")
-                            stopForeground(STOP_FOREGROUND_REMOVE)
-                            stopSelf()
-                        }
+                    if (GeoUtils.isPointInPolygon(currentPoint, activePolygon)) {
+                        // PHASE 1: They hit the circle AND the polygon at the same time.
+                        Log.d("TimesheetService", "Instantly inside polygon. Logging ENTER.")
+                        logEnter(currentPoint)
+                        startHeartbeatMode()
+                    } else {
+                        // PHASE 2: Inside the circle, but still walking to the polygon. Start Hunting.
+                        startHuntingMode()
                     }
+                } else {
+                    // Location was null, start hunting anyway to be safe
+                    startHuntingMode()
                 }
             }
     }
 
-    private fun start30MinuteHeartbeat() {
-        Log.d("TimesheetService", "Heartbeat engine started.")
+    // ==========================================
+    // PHASE 2: THE HUNTER (High Frequency)
+    // ==========================================
+    private fun startHuntingMode() {
+        if (isHunting || isTracking) return
+        isHunting = true
+
+        updateNotification("Approaching site. Waiting for boundary cross...")
+        Log.d("TimesheetService", "Hunting mode started.")
 
         serviceScope.launch {
-            while (true) {
-                // For testing purposes right now, change this to 60000L (1 minute)
+            var attempts = 0
+            // Hunt for up to 15 minutes (90 attempts * 10 seconds)
+            while (attempts < 90 && isHunting) {
+                delay(10 * 1000L) // Poll every 10 seconds while walking up to the building
+
+                if (!hasLocationPermission()) break
+
+                fusedLocationClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, null).addOnSuccessListener { loc ->
+                    if (loc != null) {
+                        val currentPoint = LatLng(loc.latitude, loc.longitude)
+                        val activePolygon = getActivePolygonFromMemory()
+
+                        if (GeoUtils.isPointInPolygon(currentPoint, activePolygon)) {
+                            Log.d("TimesheetService", "Hunter detected ENTER! Logging and switching to Heartbeat.")
+                            isHunting = false
+                            logEnter(currentPoint)
+                            startHeartbeatMode()
+                        }
+                    }
+                }
+                attempts++
+            }
+
+            // If they never entered the polygon after 15 mins of hunting, shut down to save battery
+            if (isHunting) {
+                Log.d("TimesheetService", "Hunting timed out. User never entered polygon.")
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            }
+        }
+    }
+
+    // ==========================================
+    // PHASE 3: THE HEARTBEAT (Low Frequency)
+    // ==========================================
+    private fun startHeartbeatMode() {
+        if (isTracking) return
+        isTracking = true
+        isHunting = false
+
+        updateNotification("On Site: Tracking Hours")
+        Log.d("TimesheetService", "Heartbeat mode started.")
+
+        serviceScope.launch {
+            while (isTracking) {
+                // Poll every 1 minute for testing (Change to 15 * 60 * 1000L for production)
                 delay(1 * 60 * 1000L)
 
-                Log.d("TimesheetService", "Heartbeat tick: Verifying employee location...")
+                if (!hasLocationPermission()) break
 
-                if (ContextCompat.checkSelfPermission(this@TimesheetService, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                fusedLocationClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, null).addOnSuccessListener { loc ->
+                    if (loc != null) {
+                        val currentPoint = LatLng(loc.latitude, loc.longitude)
+                        val activePolygon = getActivePolygonFromMemory()
 
-                    fusedLocationClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, null)
-                        .addOnSuccessListener { location ->
-                            if (location != null) {
-                                val currentPoint = LatLng(location.latitude, location.longitude)
-                                val activePolygon = getActivePolygonFromMemory()
-
-                                val isInside = GeoUtils.isPointInPolygon(currentPoint, activePolygon)
-
-                                if (!isInside) {
-                                    Log.d("TimesheetService", "Heartbeat detected EXIT. Employee is no longer in the polygon.")
-
-                                    // Launch a new coroutine to handle the database write safely
-                                    serviceScope.launch {
-                                        // FIXED: Changed 'type' to 'eventType' and removed 'worksiteId'
-                                        database.trackerDao().insertLog(
-                                            TimeLog(
-                                                eventType = "EXIT",
-                                                timestamp = System.currentTimeMillis(),
-                                                latitude = currentPoint.latitude,
-                                                longitude = currentPoint.longitude
-                                            )
-                                        )
-                                        // Kill the background loop and stop the service
-                                        stopForeground(STOP_FOREGROUND_REMOVE)
-                                        stopSelf()
-                                    }
-                                } else {
-                                    Log.d("TimesheetService", "Heartbeat check passed. Employee still on site.")
-                                }
-                            }
+                        if (!GeoUtils.isPointInPolygon(currentPoint, activePolygon)) {
+                            Log.d("TimesheetService", "Heartbeat detected EXIT. Logging out.")
+                            logExitAndStop(currentPoint)
+                        } else {
+                            Log.d("TimesheetService", "Heartbeat passed. Still inside.")
                         }
+                    }
                 }
             }
+        }
+    }
+
+    // ==========================================
+    // DATABASE HELPERS
+    // ==========================================
+    private fun logEnter(point: LatLng) {
+        serviceScope.launch {
+            database.trackerDao().insertLog(
+                TimeLog(eventType = "ENTER", timestamp = System.currentTimeMillis(), latitude = point.latitude, longitude = point.longitude)
+            )
+        }
+    }
+
+    private fun logExitAndStop(point: LatLng?) {
+        isTracking = false
+        isHunting = false
+
+        serviceScope.launch {
+            database.trackerDao().insertLog(
+                TimeLog(
+                    eventType = "EXIT",
+                    timestamp = System.currentTimeMillis(),
+                    latitude = point?.latitude ?: 0.0,
+                    longitude = point?.longitude ?: 0.0
+                )
+            )
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
         }
     }
 
     private fun getActivePolygonFromMemory(): List<LatLng> {
         val prefs = getSharedPreferences("FieldTrackerPrefs", Context.MODE_PRIVATE)
         val serialized = prefs.getString("ACTIVE_POLYGON", "") ?: ""
-
         if (serialized.isEmpty()) return emptyList()
-
         return serialized.split("|").mapNotNull {
             val parts = it.split(",")
             if (parts.size == 2) {
-                try {
-                    LatLng(parts[0].toDouble(), parts[1].toDouble())
-                } catch (e: Exception) { null }
+                try { LatLng(parts[0].toDouble(), parts[1].toDouble()) } catch (e: Exception) { null }
             } else null
         }
+    }
+
+    private fun hasLocationPermission(): Boolean {
+        return ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
     }
 
     private fun createNotificationChannel() {
@@ -181,14 +231,11 @@ class TimesheetService : Service() {
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_menu_mylocation)
             .build()
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.notify(1, notification)
+        getSystemService(NotificationManager::class.java).notify(1, notification)
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        Log.d("TimesheetService", "Service destroyed. Cancelling heartbeat.")
-        // This instantly kills the 30-minute while(true) loop
         serviceScope.cancel()
     }
 
