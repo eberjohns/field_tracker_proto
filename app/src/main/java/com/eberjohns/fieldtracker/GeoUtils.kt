@@ -1,50 +1,57 @@
 package com.eberjohns.fieldtracker
 
-import android.location.Location
 import com.google.android.gms.maps.model.LatLng
-import kotlin.math.max
+import kotlin.math.*
 
 object GeoUtils {
 
     /**
-     * Ray-Casting algorithm to check if a high-accuracy GPS point is inside the drawn polygon.
+     * Industry-standard Ray-Casting algorithm.
+     * Includes an explicit boundary-check for workers standing exactly on the wall.
      */
     fun isPointInPolygon(point: LatLng, polygon: List<LatLng>): Boolean {
-        var intersectCount = 0
-        for (i in 0 until polygon.size - 1) {
-            if (rayCastIntersect(point, polygon[i], polygon[i + 1])) intersectCount++
-        }
-        // Connect the last point back to the first
-        if (polygon.isNotEmpty() && rayCastIntersect(point, polygon.last(), polygon.first())) {
-            intersectCount++
-        }
-        return (intersectCount % 2) == 1
-    }
+        var intersect = false
+        var j = polygon.size - 1
+        for (i in polygon.indices) {
+            val pi = polygon[i]
+            val pj = polygon[j]
 
-    private fun rayCastIntersect(point: LatLng, vertA: LatLng, vertB: LatLng): Boolean {
-        val aY = vertA.latitude
-        val bY = vertB.latitude
-        val aX = vertA.longitude
-        val bX = vertB.longitude
-        val pY = point.latitude
-        val pX = point.longitude
+            // 1. Boundary Check: Are they standing exactly on this wall?
+            if (isOnSegment(point, pi, pj)) {
+                return true
+            }
 
-        if ((aY > pY && bY > pY) || (aY < pY && bY < pY) || (aX < pX && bX < pX)) {
-            return false // Cannot intersect
+            // 2. Standard Ray-Cast: Are they inside the polygon?
+            if (((pi.latitude > point.latitude) != (pj.latitude > point.latitude)) &&
+                (point.longitude < (pj.longitude - pi.longitude) * (point.latitude - pi.latitude) / (pj.latitude - pi.latitude) + pi.longitude)) {
+                intersect = !intersect
+            }
+            j = i
         }
-        val m = (aY - bY) / (aX - bX)
-        val bee = (-aX) * m + aY
-        val x = (pY - bee) / m
-        return x > pX
+        return intersect
     }
 
     /**
-     * Calculates the invisible OS geofence circle.
-     * Enforces a 150m minimum to prevent Android from ignoring small geofences.
+     * Checks if point 'p' lies exactly on the line segment between 'a' and 'b'.
      */
-    const val minRadius = 150f
+    private fun isOnSegment(p: LatLng, a: LatLng, b: LatLng): Boolean {
+        // First check if the point is within the bounding box of the line segment
+        if (p.latitude < min(a.latitude, b.latitude) || p.latitude > max(a.latitude, b.latitude) ||
+            p.longitude < min(a.longitude, b.longitude) || p.longitude > max(a.longitude, b.longitude)) {
+            return false
+        }
+        // Then check if it is collinear using the cross-product
+        val crossProduct = (p.latitude - a.latitude) * (b.longitude - a.longitude) - (p.longitude - a.longitude) * (b.latitude - a.latitude)
+
+        // Use a tiny tolerance (1e-9) to account for floating-point math inaccuracies
+        return abs(crossProduct) < 1e-9
+    }
+
+    /**
+     * Calculates the bounding circle without relying on the Android OS.
+     */
     fun getBoundingCircle(polygon: List<LatLng>): Pair<LatLng, Float> {
-        if (polygon.isEmpty()) return Pair(LatLng(0.0, 0.0), minRadius)
+        if (polygon.isEmpty()) return Pair(LatLng(0.0, 0.0), 150f)
 
         var sumLat = 0.0
         var sumLon = 0.0
@@ -55,13 +62,29 @@ object GeoUtils {
         val center = LatLng(sumLat / polygon.size, sumLon / polygon.size)
 
         var maxRadius = 0f
-        val results = FloatArray(1)
         for (p in polygon) {
-            Location.distanceBetween(center.latitude, center.longitude, p.latitude, p.longitude, results)
-            if (results[0] > maxRadius) maxRadius = results[0]
+            val dist = haversineDistance(center, p)
+            if (dist > maxRadius) maxRadius = dist
         }
 
-        val finalRadius = max(maxRadius, minRadius)
+        val finalRadius = max(maxRadius, 150f)
         return Pair(center, finalRadius)
+    }
+
+    /**
+     * Pure math replacement for Android's Location.distanceBetween.
+     * Calculates distance between two points on the Earth in meters.
+     */
+    private fun haversineDistance(p1: LatLng, p2: LatLng): Float {
+        val r = 6371000.0 // Earth's radius in meters
+        val dLat = Math.toRadians(p2.latitude - p1.latitude)
+        val dLon = Math.toRadians(p2.longitude - p1.longitude)
+
+        val a = sin(dLat / 2) * sin(dLat / 2) +
+                cos(Math.toRadians(p1.latitude)) * cos(Math.toRadians(p2.latitude)) *
+                sin(dLon / 2) * sin(dLon / 2)
+
+        val c = 2 * atan2(sqrt(a), sqrt(1 - a))
+        return (r * c).toFloat()
     }
 }
