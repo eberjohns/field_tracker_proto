@@ -10,7 +10,6 @@ import android.graphics.Color
 import android.os.Build
 import android.os.Bundle
 import android.widget.Button
-import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
@@ -134,12 +133,17 @@ class MainActivity : AppCompatActivity(), OnMapReadyCallback {
         // 1. Save polygon to phone memory so the Service can use it for verification
         savePolygonToMemory(polygonPoints)
 
+        val DWELL_DELAY_MS = 30 * 60 * 1000 // 30 minutes in milliseconds
+
         // 2. Build the OS Geofence
         val geofence = Geofence.Builder()
             .setRequestId("ACTIVE_WORKSITE")
             .setCircularRegion(center.latitude, center.longitude, radius)
             .setExpirationDuration(Geofence.NEVER_EXPIRE)
-            .setTransitionTypes(Geofence.GEOFENCE_TRANSITION_ENTER or Geofence.GEOFENCE_TRANSITION_EXIT)
+            // Add the DWELL trigger
+            .setTransitionTypes(Geofence.GEOFENCE_TRANSITION_ENTER or Geofence.GEOFENCE_TRANSITION_EXIT or Geofence.GEOFENCE_TRANSITION_DWELL)
+            // Tell it to trigger DWELL if they linger for 30 minutes (1800000 milliseconds)
+            .setLoiteringDelay(DWELL_DELAY_MS)
             .build()
 
         val geofencingRequest = GeofencingRequest.Builder()

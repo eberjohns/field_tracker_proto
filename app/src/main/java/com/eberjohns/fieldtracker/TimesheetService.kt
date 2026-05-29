@@ -23,7 +23,9 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import android.annotation.SuppressLint
 
+@SuppressLint("MissingPermission")
 class TimesheetService : Service() {
 
     // ========================
@@ -31,13 +33,13 @@ class TimesheetService : Service() {
     // ========================
     companion object {
         // Phase 2: How often to poll while hunting for the polygon entry
-        const val HUNTING_POLL_INTERVAL_MS = 1 * 60 * 1000L // 1 Minute
+        const val HUNTING_POLL_INTERVAL_MS = 90 * 1000L // 1.5 Minute
 
         // Phase 3: How often to poll while sitting inside the polygon
         const val HEARTBEAT_POLL_INTERVAL_MS = 30 * 60 * 1000L // 30 Minutes
 
         // Maximum number of hunting attempts before giving up (e.g., 15 attempts * 1 min = 15 mins)
-        const val MAX_HUNTING_ATTEMPTS = 15
+        const val MAX_HUNTING_ATTEMPTS = 30
     }
 
     private lateinit var fusedLocationClient: FusedLocationProviderClient
@@ -72,9 +74,15 @@ class TimesheetService : Service() {
     }
 
     private fun handleGeofenceTrigger(transitionType: Int) {
-        if (transitionType == Geofence.GEOFENCE_TRANSITION_ENTER) {
-            Log.d("TimesheetService", "OS triggered ENTER. Checking Polygon...")
+        // Catch BOTH Enter and Dwell triggers here
+        if (transitionType == Geofence.GEOFENCE_TRANSITION_ENTER ||
+            transitionType == Geofence.GEOFENCE_TRANSITION_DWELL) {
+
+            Log.d("TimesheetService", "OS triggered ENTER or DWELL. Checking Polygon...")
+
+            // This will restart the GPS check and the Hunting phase if they aren't inside yet
             checkInitialEntry()
+
         } else if (transitionType == Geofence.GEOFENCE_TRANSITION_EXIT) {
             Log.d("TimesheetService", "OS triggered EXIT. Forcing logout.")
             logExitAndStop(null)
