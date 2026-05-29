@@ -1,4 +1,4 @@
-package com.eberjohns.fieldtracker // Update this to match your exact package name
+package com.eberjohns.fieldtracker
 
 import android.location.Location
 import com.google.android.gms.maps.model.LatLng
@@ -42,8 +42,9 @@ object GeoUtils {
      * Calculates the invisible OS geofence circle.
      * Enforces a 150m minimum to prevent Android from ignoring small geofences.
      */
+    const val minRadius = 150f
     fun getBoundingCircle(polygon: List<LatLng>): Pair<LatLng, Float> {
-        if (polygon.isEmpty()) return Pair(LatLng(0.0, 0.0), 150f)
+        if (polygon.isEmpty()) return Pair(LatLng(0.0, 0.0), minRadius)
 
         var sumLat = 0.0
         var sumLon = 0.0
@@ -60,7 +61,7 @@ object GeoUtils {
             if (results[0] > maxRadius) maxRadius = results[0]
         }
 
-        val finalRadius = max(maxRadius, 150f)
+        val finalRadius = max(maxRadius, minRadius)
         return Pair(center, finalRadius)
     }
 }

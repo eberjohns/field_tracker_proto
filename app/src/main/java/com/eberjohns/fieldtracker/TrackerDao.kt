@@ -17,4 +17,8 @@ interface TrackerDao {
     // Optional: A quick way to wipe the timesheet for a new day
     @Query("DELETE FROM time_logs")
     suspend fun clearAllLogs()
+
+    // Fetches only the single most recent log to prevent double-entries
+    @Query("SELECT * FROM time_logs ORDER BY timestamp DESC LIMIT 1")
+    suspend fun getLastLog(): TimeLog?
 }
